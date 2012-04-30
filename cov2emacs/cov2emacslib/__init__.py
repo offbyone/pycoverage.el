@@ -28,17 +28,24 @@ class BasicReporter(Reporter):
     Since the .coverage file only contains the line's covered we need
     to use Coverage.py's logic to determine the 'missing' lines.
     """
-    def __init__(self, report_file, ignore_errors=False):
+    def __init__(self, report_file, path_mappings=[], ignore_errors=False):
         coverage = cv(report_file)
         coverage.use_cache(True)
         coverage.load()
+        self.path_mappings = path_mappings
         super(BasicReporter, self).__init__(coverage, ignore_errors)
-        
+
     def report_filenames(self, filenames=None):
         filenames = filenames or []
         for filename in filenames:
-            yield self.coverage.analysis(filename)
-        
+            mapped_filename = self.map_name(filename)
+            yield self.coverage.analysis(mapped_filename)
+
+    def map_name(self, name):
+        for build_name, source_name in self.path_mappings:
+            if name.startswith(source_name):
+                return build_name + name[len(source_name):]
+        return name
 
     def report(self, morfs=None, directory=None, omit_prefixes=None):
         for result in self.report_files(morfs, directory, omit_prefixes):
@@ -82,22 +89,29 @@ class Coverage2Emacs(object):
             raise Exception('wrong filename %s' % cov_file)
         self.cov_file = cov_file
 
-    def to_emacs_flymake_mode(self, filename, fout=None):
+    def unmap_names(self, name, mappings):
+        for build_name, source_name in mappings:
+            if name.startswith(build_name):
+                return source_name + name[len(build_name):]
+        return name
+
+    def to_emacs_flymake_mode(self, filename, fout=None, path_mappings=[]):
         """
         flymake mode output looks like this:
         filename:lineno: Warning|Error (function):msg
         """
         fout = fout or sys.stdout
-        reporter = BasicReporter(self.cov_file)
+        reporter = BasicReporter(self.cov_file, path_mappings)
         for cu, statements, excluded, missing in reporter.report():
-            if cu.filename != filename:
+            real_name = self.unmap_names(cu.filename, path_mappings)
+            if real_name != filename:
                 # probably could filter earlier to speed things up
                 continue
             for line in missing:
-                fout.write('%s:%s: Error Line not covered by test\n' %(cu.filename, line))
+                fout.write('%s:%s: Error Line not covered by test\n' %(real_name, line))
 
     def to_emacs_compile_mode(self, fout=None, filenames=None, combine_nums=False,
-                              status_line=True):
+                              status_line=True, path_mappings=[]):
         """
         spit out something easy to parse in emacs ie:
 
@@ -105,15 +119,18 @@ class Coverage2Emacs(object):
 
         Message can be Covered|Ignored|Missed
         """
-        filenames = [os.path.abspath(f) for f in filenames] or []
+        filenames = [os.path.realpath(f) for f in filenames] or []
         LOG.debug('compile_mode filenames: %s' % filenames)
         fout = fout or sys.stdout
-        reporter = BasicReporter(self.cov_file)
+        reporter = BasicReporter(self.cov_file, path_mappings)
         # convert the report output to a more useful generator
         data_iter = []
         for file, executable_lines, not_executed, summary in reporter.report_filenames(filenames):
+            file = self.unmap_names(file, path_mappings)
+            LOG.debug("Emitting coverage for %s", file)
             # executable lines are lines that can "run" versus comments/etc
             percent_executed = 100*(len(executable_lines) - len(not_executed) + 0.)/len(executable_lines)
+            LOG.debug("%s : %s%% covered", file, percent_executed)
             data_iter.append((file, not_executed, 'MISSING', percent_executed))
         filtered_names = self.filter_old_files(data_iter)
         for filename, lines, status, percent in filtered_names:
@@ -125,14 +142,14 @@ class Coverage2Emacs(object):
                 continue
             elif status:
                 fout.write('SUCCESS:%d\n' % percent)
-            if combine_nums: 
+            if combine_nums:
                 for line_chunk in combine_linenums(lines):
                     fout.write('%s:%s:%s\n' %(filename, line_chunk, status))
             else:
                 for num in lines:
                     fout.write('%s:%s:%s\n' %(filename, num, status))
 
-            
+
 
     def filter_old_files(self, data_iter):
         cov_date = os.stat(self.cov_file).st_mtime
@@ -148,7 +165,7 @@ class Coverage2Emacs(object):
                 LOG.debug("FILTERING %s date: %s > %s" % (filename, file_date, cov_date))
                 # assume that file has been tweeked and data is wrong
                 data = list(data)
-                data[2] = "OLD"            
+                data[2] = "OLD"
             yield data
             prev_file = filename
 
@@ -185,9 +202,9 @@ def find_coverage_file(start_file, file_to_find='.coverage'):
         else:
             LOG.debug('OLDER: %s' % potential)
     return None
-        
 
-            
+
+
 def combine_linenums(linenums):
     """
     >>> list(combine_linenums([1,2,3]))
@@ -215,15 +232,15 @@ def combine_linenums(linenums):
     if prev_num and prev_start:
         if prev_start == prev_num:
             yield '%d' % prev_num
-        else:    
+        else:
             yield '%d-%d' %(prev_start, num)
     elif prev_num:
         yield '%d' % prev_num
-            
+
 def _test():
     import doctest
     doctest.testmod()
-                              
+
 
 def main(prog_args):
     parser = optparse.OptionParser(version=meta.__version__)
@@ -236,6 +253,7 @@ def main(prog_args):
 
     compile_group = optparse.OptionGroup(parser, "Compile mode")
     group.add_option('--compile-mode', action='store_true', help='spit out compile compatible output')
+    group.add_option('--path-rewrite', action='append', default=[], help='A:B -- map from A -> B in the coverage output')
     parser.add_option_group(compile_group)
 
     func_group = optparse.OptionGroup(parser, "Run a function with coverage")
@@ -261,19 +279,25 @@ def main(prog_args):
             print "NO COVERAGE FILE::"
             return
 
+        path_rewrites = []
+        def to_path_pair(pair):
+            build, source = pair.split(':', 1)
+            return (os.path.realpath(build), os.path.realpath(source))
+        if opt.path_rewrite:
+            path_rewrites = [to_path_pair(p) for p in opt.path_rewrite]
+
     if opt.function_name:
         findtests.get_coverage_for_function(opt.function_name, opt.python_file)
         cov = find_coverage_file(opt.python_file)
         c2e = Coverage2Emacs(cov)
 
     if opt.flymake:
-        c2e.to_emacs_flymake_mode(opt.python_file)
+        c2e.to_emacs_flymake_mode(opt.python_file, path_mappings=path_rewrites)
     elif opt.compile_mode:
         filenames = []
         if opt.python_file:
             filenames.append(opt.python_file)
-        c2e.to_emacs_compile_mode(filenames=filenames)
-        
+        c2e.to_emacs_compile_mode(filenames=filenames, path_mappings=path_rewrites)
+
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
-
